@@ -14,17 +14,17 @@ import (
 )
 
 var (
-	PORT         = ":8080"
-	WORKER_ADDR  = os.Getenv("WORKER_ADDR") // Dirección del Cluster de Workers
-	REDIS_ADDR   = os.Getenv("REDIS_ADDR")  // Dirección de Redis
-	ctx          = context.Background()
-	redisClient  *redis.Client
+	PORT        = ":8080"
+	WORKER_ADDR = os.Getenv("WORKER_ADDR") // Dirección del Cluster de Workers
+	REDIS_ADDR  = os.Getenv("REDIS_ADDR")  // Dirección de Redis
+	ctx         = context.Background()
+	redisClient *redis.Client
 )
 
 func init() {
-	
+
 	if WORKER_ADDR == "" {
-		WORKER_ADDR = "localhost:8081" 
+		WORKER_ADDR = "localhost:8081"
 	}
 	if REDIS_ADDR == "" {
 		REDIS_ADDR = "localhost:6379"
@@ -36,7 +36,7 @@ type APIRequest struct {
 }
 
 type APIResponse struct {
-	Source          string             `json:"source"` 
+	Source          string             `json:"source"`
 	ProcessingTime  string             `json:"processing_time"`
 	Recommendations []SimilarityResult `json:"recommendations"`
 }
@@ -63,7 +63,7 @@ func main() {
 
 	// 2. Definir Rutas HTTP
 	http.HandleFunc("/recommend", handleRecommend)
-	
+
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
@@ -73,12 +73,11 @@ func main() {
 	log.Printf("API Coordinador escuchando en %s", PORT)
 	log.Printf("Conectando a Workers en: %s", WORKER_ADDR)
 	log.Printf("Conectando a Redis en: %s", REDIS_ADDR)
-	
+
 	if err := http.ListenAndServe(PORT, nil); err != nil {
 		log.Fatalf("Error fatal en API: %v", err)
 	}
 }
-
 
 func handleRecommend(w http.ResponseWriter, r *http.Request) {
 
@@ -98,15 +97,15 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	// 2. Consultar CACHÉ (Redis)
 	cachedVal, err := redisClient.Get(ctx, "rec:"+userID).Result()
 	if err == nil {
-	
+
 		log.Printf("Cache HIT para %s", userID)
-		w.Write([]byte(cachedVal)) 
+		w.Write([]byte(cachedVal))
 		return
 	}
 
 	// 3. Si no hay caché (CACHE MISS), llamar al Cluster de Workers
 	log.Printf("Cache MISS para %s. Enviando tarea al Cluster...", userID)
-	
+
 	workerResp, err := callWorkerCluster(userID)
 	if err != nil {
 		log.Printf("Error en Cluster: %v", err)
@@ -123,7 +122,7 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 
 	// 5. Guardar en Redis (TTL 10 minutos) y Responder
 	jsonBytes, _ := json.Marshal(apiResp)
-	
+
 	// Guardar asíncronamente para no bloquear la respuesta
 	go func() {
 		err := redisClient.Set(ctx, "rec:"+userID, jsonBytes, 10*time.Minute).Err()
@@ -136,7 +135,7 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 }
 
 func callWorkerCluster(targetID string) (*WorkerResponse, error) {
-	
+
 	conn, err := net.DialTimeout("tcp", WORKER_ADDR, 5*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("no se pudo conectar con ningún worker: %v", err)
@@ -150,7 +149,7 @@ func callWorkerCluster(targetID string) (*WorkerResponse, error) {
 	}
 
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	
+
 	var resp WorkerResponse
 	decoder := json.NewDecoder(conn)
 	if err := decoder.Decode(&resp); err != nil {
@@ -164,12 +163,11 @@ func callWorkerCluster(targetID string) (*WorkerResponse, error) {
 	return &resp, nil
 }
 
-
 func initRedis() {
 	redisClient = redis.NewClient(&redis.Options{
 		Addr:     REDIS_ADDR,
-		Password: "", 
-		DB:       0,   por defecto
+		Password: "",
+		DB:       0,
 	})
 
 	_, err := redisClient.Ping(ctx).Result()
