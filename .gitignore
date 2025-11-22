@@ -1,0 +1,12 @@
+.vscode/
+.idea/
+
+*.exe
+*.dll
+*.so
+
+ml-10M100K/
+ml-10m.zip
+*.dat
+
+mongo_data/

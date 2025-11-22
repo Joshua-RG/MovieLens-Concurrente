@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  # Servicio de Base de Datos (MongoDB)
+  mongodb:
+    image: mongo:latest
+    container_name: movielens_mongo
+    restart: always
+    ports:
+      - "27017:27017" 
+    volumes:
+      - mongo_data:/data/db 
+    networks:
+      - movielens-net
+
+  # Servicio de Caché (Redis)
+  redis:
+    image: redis:alpine
+    container_name: movielens_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - movielens-net
+
+volumes:
+  mongo_data:
+
+networks:
+  movielens-net:
+    driver: bridge
