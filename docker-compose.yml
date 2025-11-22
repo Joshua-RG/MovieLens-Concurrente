@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Servicio de Base de Datos (MongoDB)
+ 
   mongodb:
     image: mongo:latest
     container_name: movielens_mongo
@@ -9,11 +9,10 @@ services:
     ports:
       - "27017:27017" 
     volumes:
-      - mongo_data:/data/db 
+      - mongo_data:/data/db
     networks:
       - movielens-net
 
-  # Servicio de Caché (Redis)
   redis:
     image: redis:alpine
     container_name: movielens_redis
@@ -23,9 +22,26 @@ services:
     networks:
       - movielens-net
 
-volumes:
-  mongo_data:
+  api:
+    container_name: movielens_api
+    build:
+      context: .             
+      dockerfile: api/Dockerfile
+    ports:
+      - "8080:8080"           
+    environment:
+      - REDIS_ADDR=redis:6379
+      - WORKER_ADDR=worker:8081 
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - movielens-net
 
-networks:
-  movielens-net:
-    driver: bridge
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    deploy:
+      mode: replicated
+      replicas: 6
