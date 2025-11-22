@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
  
   mongodb:
@@ -7,7 +5,7 @@ services:
     container_name: movielens_mongo
     restart: always
     ports:
-      - "27017:27017" 
+      - "27017:27017"
     volumes:
       - mongo_data:/data/db
     networks:
@@ -25,13 +23,13 @@ services:
   api:
     container_name: movielens_api
     build:
-      context: .             
+      context: .
       dockerfile: api/Dockerfile
     ports:
-      - "8080:8080"           
+      - "8080:8080"
     environment:
       - REDIS_ADDR=redis:6379
-      - WORKER_ADDR=worker:8081 
+      - WORKER_ADDR=worker:8081
     depends_on:
       - mongodb
       - redis
@@ -39,9 +37,23 @@ services:
       - movielens-net
 
   worker:
+   
     build:
       context: .
       dockerfile: worker/Dockerfile
     deploy:
       mode: replicated
-      replicas: 6
+      replicas: 3
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017
+    depends_on:
+      - mongodb
+    networks:
+      - movielens-net
+
+volumes:
+  mongo_data:
+
+networks:
+  movielens-net:
+    driver: bridge
