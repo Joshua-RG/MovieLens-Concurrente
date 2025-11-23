@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +31,7 @@ type WorkerRequest struct {
 	TargetUserID string `json:"target_user_id"`
 	RangeStart   int    `json:"range_start"`
 	RangeEnd     int    `json:"range_end"`
-	GenreFilter  string `json:"genre_filter"` // [NUEVO]
+	GenreFilter  string `json:"genre_filter"`
 }
 
 type WorkerResponse struct {
@@ -40,6 +43,7 @@ type WorkerResponse struct {
 
 type MovieRecommendation struct {
 	MovieID string  `json:"movie_id"`
+	Title   string  `json:"title"` // [NUEVO] Recibimos el título
 	Score   float64 `json:"score"`
 }
 
@@ -47,7 +51,8 @@ type APIResponse struct {
 	Source          string                `json:"source"`
 	ProcessingTime  string                `json:"processing_time"`
 	TotalProcessed  int                   `json:"total_processed_users"`
-	FilterUsed      string                `json:"filter_used"` // [NUEVO]
+	FilterUsed      string                `json:"filter_used"`
+	UserName        string                `json:"user_name"` // [NUEVO] Nombre del usuario
 	Recommendations []MovieRecommendation `json:"recommendations"`
 }
 
@@ -66,12 +71,13 @@ func main() {
 func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	userID := r.URL.Query().Get("user_id")
-	genre := r.URL.Query().Get("genre") // [NUEVO] Leer género
+	genre := r.URL.Query().Get("genre")
 
-	// [IMPORTANTE] Clave de Caché debe incluir el género
+	// Generar nombre ficticio para el usuario
+	fakeName := generateFakeName(userID)
+
 	cacheKey := "rec:" + userID + ":" + genre
 
-	// 1. Check Caché
 	val, err := redisClient.Get(ctx, cacheKey).Result()
 	if err == nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -79,7 +85,6 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Scatter (Distribuir)
 	numWorkers := len(WORKER_ADDRS)
 	chunkSize := TOTAL_USERS / numWorkers
 
@@ -96,7 +101,6 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 
 		go func(address string, start, end int) {
 			defer wg.Done()
-			// [CAMBIO] Pasamos 'genre' al worker
 			resp, err := callWorker(address, userID, start, end, genre)
 			if err == nil {
 				resultsChan <- *resp
@@ -107,22 +111,28 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 	close(resultsChan)
 
-	// 3. Gather (Sumar puntajes de películas)
 	movieScores := make(map[string]float64)
+	movieTitles := make(map[string]string) // Mapa temporal para guardar títulos
 	totalProc := 0
 
 	for resp := range resultsChan {
 		totalProc += resp.ProcessedCount
-		// Sumar puntajes parciales de cada worker
 		for _, rec := range resp.Recommendations {
 			movieScores[rec.MovieID] += rec.Score
+			// Guardamos el título (todos los workers mandan el mismo título para el mismo ID)
+			if rec.Title != "" {
+				movieTitles[rec.MovieID] = rec.Title
+			}
 		}
 	}
 
-	// Convertir a lista y ordenar
 	var finalRecs []MovieRecommendation
 	for mID, score := range movieScores {
-		finalRecs = append(finalRecs, MovieRecommendation{MovieID: mID, Score: score})
+		finalRecs = append(finalRecs, MovieRecommendation{
+			MovieID: mID,
+			Title:   movieTitles[mID], // Recuperamos título
+			Score:   score,
+		})
 	}
 
 	sort.Slice(finalRecs, func(i, j int) bool {
@@ -132,18 +142,16 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 		finalRecs = finalRecs[:10]
 	}
 
-	// Respuesta final
 	respObj := APIResponse{
 		Source:          "Distributed Cluster",
 		ProcessingTime:  time.Since(start).String(),
 		TotalProcessed:  totalProc,
 		FilterUsed:      genre,
+		UserName:        fakeName, // [NUEVO] Enviamos nombre
 		Recommendations: finalRecs,
 	}
 
 	jsonBytes, _ := json.Marshal(respObj)
-
-	// Guardar en Redis
 	redisClient.Set(ctx, cacheKey, jsonBytes, 10*time.Minute)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -161,11 +169,33 @@ func callWorker(addr, userID string, start, end int, genre string) (*WorkerRespo
 		TargetUserID: userID,
 		RangeStart:   start,
 		RangeEnd:     end,
-		GenreFilter:  genre, // [NUEVO]
+		GenreFilter:  genre,
 	}
 	json.NewEncoder(conn).Encode(req)
 
 	var resp WorkerResponse
 	json.NewDecoder(conn).Decode(&resp)
 	return &resp, nil
+}
+
+// --- GENERADOR DE NOMBRES ALEATORIOS (Determinista) ---
+func generateFakeName(userID string) string {
+	adjectives := []string{"Happy", "Lucky", "Sunny", "Clever", "Brave", "Calm", "Eager", "Fancy", "Jolly", "Kind"}
+	animals := []string{"Panda", "Tiger", "Eagle", "Lion", "Dolphin", "Fox", "Wolf", "Hawk", "Bear", "Owl"}
+
+	// Usar hash del UserID para elegir siempre el mismo nombre para el mismo ID
+	h := fnv.New32a()
+	h.Write([]byte(userID))
+	hashVal := h.Sum32()
+
+	adjIndex := int(hashVal) % len(adjectives)
+	aniIndex := int(hashVal) % len(animals)
+
+	// Si el ID es numérico, añadimos el ID al final para que se vea único
+	// Ejemplo: "Happy Panda #123"
+	if _, err := strconv.Atoi(userID); err == nil {
+		return fmt.Sprintf("%s %s #%s", adjectives[adjIndex], animals[aniIndex], userID)
+	}
+
+	return fmt.Sprintf("%s %s", adjectives[adjIndex], animals[aniIndex])
 }
