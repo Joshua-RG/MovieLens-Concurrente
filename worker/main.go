@@ -184,7 +184,7 @@ func calculateRangeParallel(targetID string, start, end int, genreFilter string)
 
 				if dotProduct > 0 {
 					similarity := dotProduct / (targetNorm * otherNorm)
-					if similarity > 0.3 {
+					if similarity > 0.01 {
 						for mID, rating := range otherMovies {
 							if _, seen := targetMovies[mID]; !seen {
 								if genreFilter != "" && !strings.Contains(movieGenres[mID], genreFilter) {
