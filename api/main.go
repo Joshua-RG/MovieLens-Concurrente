@@ -3,177 +3,169 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 var (
-	PORT        = ":8080"
-	WORKER_ADDR = os.Getenv("WORKER_ADDR") // Dirección del Cluster de Workers
-	REDIS_ADDR  = os.Getenv("REDIS_ADDR")  // Dirección de Redis
-	ctx         = context.Background()
-	redisClient *redis.Client
+	PORT         = ":8080"
+	WORKER_ADDRS = strings.Split(os.Getenv("WORKER_ADDRS"), ",")
+	REDIS_ADDR   = os.Getenv("REDIS_ADDR")
+	ctx          = context.Background()
+	redisClient  *redis.Client
+	TOTAL_USERS  = 70000
 )
-
-func init() {
-
-	if WORKER_ADDR == "" {
-		WORKER_ADDR = "localhost:8081"
-	}
-	if REDIS_ADDR == "" {
-		REDIS_ADDR = "localhost:6379"
-	}
-}
-
-type APIRequest struct {
-	UserID string `json:"user_id"`
-}
-
-type APIResponse struct {
-	Source          string             `json:"source"`
-	ProcessingTime  string             `json:"processing_time"`
-	Recommendations []SimilarityResult `json:"recommendations"`
-}
-
-type SimilarityResult struct {
-	UserID string  `json:"user_id"`
-	Score  float64 `json:"score"`
-}
 
 type WorkerRequest struct {
 	TargetUserID string `json:"target_user_id"`
+	RangeStart   int    `json:"range_start"`
+	RangeEnd     int    `json:"range_end"`
+	GenreFilter  string `json:"genre_filter"` // [NUEVO]
 }
 
 type WorkerResponse struct {
-	NodeID          string             `json:"node_id"`
-	ProcessedCount  int                `json:"processed_count"`
-	Recommendations []SimilarityResult `json:"recommendations"`
-	Error           string             `json:"error,omitempty"`
+	NodeID          string                `json:"node_id"`
+	ProcessedCount  int                   `json:"processed_count"`
+	Recommendations []MovieRecommendation `json:"recommendations"`
+	Error           string                `json:"error,omitempty"`
+}
+
+type MovieRecommendation struct {
+	MovieID string  `json:"movie_id"`
+	Score   float64 `json:"score"`
+}
+
+type APIResponse struct {
+	Source          string                `json:"source"`
+	ProcessingTime  string                `json:"processing_time"`
+	TotalProcessed  int                   `json:"total_processed_users"`
+	FilterUsed      string                `json:"filter_used"` // [NUEVO]
+	Recommendations []MovieRecommendation `json:"recommendations"`
 }
 
 func main() {
-	// 1. Inicializar Redis
-	initRedis()
-
-	// 2. Definir Rutas HTTP
-	http.HandleFunc("/recommend", handleRecommend)
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	// 3. Iniciar Servidor
-	log.Printf("API Coordinador escuchando en %s", PORT)
-	log.Printf("Conectando a Workers en: %s", WORKER_ADDR)
-	log.Printf("Conectando a Redis en: %s", REDIS_ADDR)
-
-	if err := http.ListenAndServe(PORT, nil); err != nil {
-		log.Fatalf("Error fatal en API: %v", err)
+	if len(WORKER_ADDRS) == 0 || WORKER_ADDRS[0] == "" {
+		WORKER_ADDRS = []string{"localhost:8081"}
 	}
+
+	redisClient = redis.NewClient(&redis.Options{Addr: REDIS_ADDR})
+
+	http.HandleFunc("/recommend", handleRecommend)
+	log.Printf("🌐 API Coordinador lista. Workers: %v", WORKER_ADDRS)
+	http.ListenAndServe(PORT, nil)
 }
 
 func handleRecommend(w http.ResponseWriter, r *http.Request) {
-
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Content-Type", "application/json")
-
 	start := time.Now()
-
 	userID := r.URL.Query().Get("user_id")
-	if userID == "" {
-		http.Error(w, `{"error": "user_id parameter is required"}`, http.StatusBadRequest)
-		return
-	}
+	genre := r.URL.Query().Get("genre") // [NUEVO] Leer género
 
-	log.Printf("Petición recibida para Usuario: %s", userID)
+	// [IMPORTANTE] Clave de Caché debe incluir el género
+	cacheKey := "rec:" + userID + ":" + genre
 
-	// 2. Consultar CACHÉ (Redis)
-	cachedVal, err := redisClient.Get(ctx, "rec:"+userID).Result()
+	// 1. Check Caché
+	val, err := redisClient.Get(ctx, cacheKey).Result()
 	if err == nil {
-
-		log.Printf("Cache HIT para %s", userID)
-		w.Write([]byte(cachedVal))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(val))
 		return
 	}
 
-	// 3. Si no hay caché (CACHE MISS), llamar al Cluster de Workers
-	log.Printf("Cache MISS para %s. Enviando tarea al Cluster...", userID)
+	// 2. Scatter (Distribuir)
+	numWorkers := len(WORKER_ADDRS)
+	chunkSize := TOTAL_USERS / numWorkers
 
-	workerResp, err := callWorkerCluster(userID)
-	if err != nil {
-		log.Printf("Error en Cluster: %v", err)
-		http.Error(w, fmt.Sprintf(`{"error": "Calculation failed: %v"}`, err), http.StatusInternalServerError)
-		return
-	}
+	var wg sync.WaitGroup
+	resultsChan := make(chan WorkerResponse, numWorkers)
 
-	// 4. Construir Respuesta Final
-	apiResp := APIResponse{
-		Source:          fmt.Sprintf("worker-cluster (Node: %s)", workerResp.NodeID),
-		ProcessingTime:  time.Since(start).String(),
-		Recommendations: workerResp.Recommendations,
-	}
-
-	// 5. Guardar en Redis (TTL 10 minutos) y Responder
-	jsonBytes, _ := json.Marshal(apiResp)
-
-	// Guardar asíncronamente para no bloquear la respuesta
-	go func() {
-		err := redisClient.Set(ctx, "rec:"+userID, jsonBytes, 10*time.Minute).Err()
-		if err != nil {
-			log.Printf("Error guardando en Redis: %v", err)
+	for i, addr := range WORKER_ADDRS {
+		wg.Add(1)
+		rStart := i * chunkSize
+		rEnd := rStart + chunkSize
+		if i == numWorkers-1 {
+			rEnd = TOTAL_USERS + 1000
 		}
-	}()
 
+		go func(address string, start, end int) {
+			defer wg.Done()
+			// [CAMBIO] Pasamos 'genre' al worker
+			resp, err := callWorker(address, userID, start, end, genre)
+			if err == nil {
+				resultsChan <- *resp
+			}
+		}(addr, rStart, rEnd)
+	}
+
+	wg.Wait()
+	close(resultsChan)
+
+	// 3. Gather (Sumar puntajes de películas)
+	movieScores := make(map[string]float64)
+	totalProc := 0
+
+	for resp := range resultsChan {
+		totalProc += resp.ProcessedCount
+		// Sumar puntajes parciales de cada worker
+		for _, rec := range resp.Recommendations {
+			movieScores[rec.MovieID] += rec.Score
+		}
+	}
+
+	// Convertir a lista y ordenar
+	var finalRecs []MovieRecommendation
+	for mID, score := range movieScores {
+		finalRecs = append(finalRecs, MovieRecommendation{MovieID: mID, Score: score})
+	}
+
+	sort.Slice(finalRecs, func(i, j int) bool {
+		return finalRecs[i].Score > finalRecs[j].Score
+	})
+	if len(finalRecs) > 10 {
+		finalRecs = finalRecs[:10]
+	}
+
+	// Respuesta final
+	respObj := APIResponse{
+		Source:          "Distributed Cluster",
+		ProcessingTime:  time.Since(start).String(),
+		TotalProcessed:  totalProc,
+		FilterUsed:      genre,
+		Recommendations: finalRecs,
+	}
+
+	jsonBytes, _ := json.Marshal(respObj)
+
+	// Guardar en Redis
+	redisClient.Set(ctx, cacheKey, jsonBytes, 10*time.Minute)
+
+	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonBytes)
 }
 
-func callWorkerCluster(targetID string) (*WorkerResponse, error) {
-
-	conn, err := net.DialTimeout("tcp", WORKER_ADDR, 5*time.Second)
+func callWorker(addr, userID string, start, end int, genre string) (*WorkerResponse, error) {
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("no se pudo conectar con ningún worker: %v", err)
+		return nil, err
 	}
 	defer conn.Close()
 
-	req := WorkerRequest{TargetUserID: targetID}
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(req); err != nil {
-		return nil, fmt.Errorf("error enviando tarea: %v", err)
+	req := WorkerRequest{
+		TargetUserID: userID,
+		RangeStart:   start,
+		RangeEnd:     end,
+		GenreFilter:  genre, // [NUEVO]
 	}
-
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	json.NewEncoder(conn).Encode(req)
 
 	var resp WorkerResponse
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&resp); err != nil {
-		return nil, fmt.Errorf("error recibiendo respuesta del worker: %v", err)
-	}
-
-	if resp.Error != "" {
-		return nil, fmt.Errorf("worker reportó error: %s", resp.Error)
-	}
-
+	json.NewDecoder(conn).Decode(&resp)
 	return &resp, nil
-}
-
-func initRedis() {
-	redisClient = redis.NewClient(&redis.Options{
-		Addr:     REDIS_ADDR,
-		Password: "",
-		DB:       0,
-	})
-
-	_, err := redisClient.Ping(ctx).Result()
-	if err != nil {
-		log.Printf("Advertencia: No se pudo conectar a Redis en %s. La caché no funcionará. (%v)", REDIS_ADDR, err)
-	} else {
-		log.Println("Redis conectado y listo.")
-	}
 }

@@ -3,29 +3,40 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"math"
 	"net"
 	"os"
-	"runtime"
 	"sort"
+	"strings"
 	"sync"
-	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const (
-	PORT        = ":8081"
-	MIN_RATINGS = 5
-)
+const PORT = ":8081"
 
-// UserRatings: Mapa en memoria para acceso O(1) a los ratings de un usuario
-// Map[UserID] -> Map[MovieID] -> Rating
-type UserRatings map[string]map[string]float64
+// --- ESTRUCTURAS ---
+type WorkerRequest struct {
+	TargetUserID string `json:"target_user_id"`
+	RangeStart   int    `json:"range_start"`
+	RangeEnd     int    `json:"range_end"`
+	GenreFilter  string `json:"genre_filter"` // [NUEVO] Parámetro de Género
+}
+
+type WorkerResponse struct {
+	NodeID          string                `json:"node_id"`
+	ProcessedCount  int                   `json:"processed_count"`
+	Recommendations []MovieRecommendation `json:"recommendations"` // [CAMBIO] Devolvemos Películas
+	Error           string                `json:"error,omitempty"`
+}
+
+type MovieRecommendation struct { // [NUEVO] Estructura para películas
+	MovieID string  `json:"movie_id"`
+	Score   float64 `json:"score"`
+}
 
 type RatingDoc struct {
 	UserID  string  `bson:"user_id"`
@@ -33,273 +44,213 @@ type RatingDoc struct {
 	Score   float64 `bson:"score"`
 }
 
-type WorkerRequest struct {
-	TargetUserID string `json:"target_user_id"`
+type MovieDoc struct { // [NUEVO] Para cargar géneros
+	ID     string `bson:"_id"`
+	Genres string `bson:"genres"`
 }
 
-type WorkerResponse struct {
-	NodeID          string             `json:"node_id"`
-	ProcessedCount  int                `json:"processed_count"`
-	Recommendations []SimilarityResult `json:"recommendations"`
-	Error           string             `json:"error,omitempty"`
-}
-
-type SimilarityResult struct {
-	UserID string  `json:"user_id"`
-	Score  float64 `json:"score"`
-}
-
+// --- VARIABLES GLOBALES ---
 var (
-	dataMutex    sync.RWMutex
-	globalData   UserRatings
-	allUserIDs   []string
-	nodeHostname string
+	dataMutex   sync.RWMutex
+	userRatings map[string]map[string]float64
+	userNorms   map[string]float64
+	movieGenres map[string]string // [NUEVO] Mapa de ID -> Géneros (RAM)
+	allUserIDs  []string
+	nodeID      string
 )
 
 func main() {
+	nodeID = os.Getenv("NODE_ID")
+	if nodeID == "" {
+		nodeID, _ = os.Hostname()
+	}
+	log.Printf("👷 Nodo ML #%s Iniciando...", nodeID)
 
-	nodeHostname, _ = os.Hostname()
-	log.Printf("Nodo ML [%s] Iniciando...", nodeHostname)
-
-	// 1. Cargar Datos de MongoDB a Memoria
-	if err := loadDataFromMongo(); err != nil {
-		log.Fatalf("Error fatal cargando datos: %v", err)
+	// 1. PREPROCESAMIENTO (Carga Ratings + Películas)
+	if err := loadAndPreprocess(); err != nil {
+		log.Fatalf("❌ Error en preprocesamiento: %v", err)
 	}
 
-	// 2. Iniciar Servidor TCP
 	listener, err := net.Listen("tcp", PORT)
 	if err != nil {
-		log.Fatalf("Error iniciando TCP: %v", err)
+		log.Fatalf("❌ Error TCP: %v", err)
 	}
 	defer listener.Close()
 
-	log.Printf("Nodo ML listo y escuchando en %s", PORT)
-	log.Printf("Datos en memoria: %d usuarios cargados.", len(allUserIDs))
+	log.Printf("🚀 Nodo #%s LISTO. Escuchando en %s", nodeID, PORT)
 
-	// 3. Bucle de aceptación de tareas
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Error de conexión: %v", err)
 			continue
 		}
-
 		go handleConnection(conn)
 	}
 }
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
-	start := time.Now()
 
-	// 1. Decodificar la tarea
 	var req WorkerRequest
-	decoder := json.NewDecoder(conn)
-	if err := decoder.Decode(&req); err != nil {
-		log.Printf("⚠️ Error decodificando JSON: %v", err)
+	if err := json.NewDecoder(conn).Decode(&req); err != nil {
 		return
 	}
 
-	log.Printf("Tarea recibida: Calcular para %s", req.TargetUserID)
-
-	// 2. EJECUTAR CÁLCULO
-	results, count, err := calculateSimilarityDistributed(req.TargetUserID)
+	// [CAMBIO] Pasamos el filtro de género al cálculo
+	results, count := calculateRange(req.TargetUserID, req.RangeStart, req.RangeEnd, req.GenreFilter)
 
 	resp := WorkerResponse{
-		NodeID:         nodeHostname,
-		ProcessedCount: count,
+		NodeID:          nodeID,
+		ProcessedCount:  count,
+		Recommendations: results,
 	}
 
-	if err != nil {
-		resp.Error = err.Error()
-	} else {
-		resp.Recommendations = results
-	}
-
-	// 3. Enviar Respuesta
-	encoder := json.NewEncoder(conn)
-	if err := encoder.Encode(resp); err != nil {
-		log.Printf("Error enviando respuesta: %v", err)
-	}
-
-	log.Printf("Tarea completada para %s en %v (Comparado con %d usuarios)", req.TargetUserID, time.Since(start), count)
+	json.NewEncoder(conn).Encode(resp)
 }
 
-// calculateSimilarityDistributed realiza la comparación 1-vs-N
-// Utiliza paralelismo interno para aprovechar todos los núcleos del Worker.
-func calculateSimilarityDistributed(targetID string) ([]SimilarityResult, int, error) {
-	dataMutex.RLock()
-	defer dataMutex.RUnlock()
-
-	targetRatings, ok := globalData[targetID]
-	if !ok {
-		return nil, 0, fmt.Errorf("usuario objetivo %s no encontrado en este nodo", targetID)
-	}
-
-	numUsers := len(allUserIDs)
-	if numUsers == 0 {
-		return []SimilarityResult{}, 0, nil
-	}
-
-	// A. Configuración de Paralelismo Interno
-	// Usamos el número de CPUs disponibles en este contenedor
-	numWorkers := runtime.NumCPU()
-	chunkSize := (numUsers + numWorkers - 1) / numWorkers
-
-	// Canal para recolectar resultados parciales de cada goroutine interna
-	resultsChan := make(chan []SimilarityResult, numWorkers)
-	var wg sync.WaitGroup
-
-	for i := 0; i < numWorkers; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > numUsers {
-			end = numUsers
-		}
-
-		wg.Add(1)
-		go func(s, e int) {
-			defer wg.Done()
-			localResults := make([]SimilarityResult, 0, (e-s)/10)
-
-			for idx := s; idx < e; idx++ {
-				otherUserID := allUserIDs[idx]
-
-				if otherUserID == targetID {
-					continue
-				}
-
-				otherRatings := globalData[otherUserID]
-				score := cosineSimilarity(targetRatings, otherRatings)
-
-				if score > 0.1 {
-					localResults = append(localResults, SimilarityResult{
-						UserID: otherUserID,
-						Score:  score,
-					})
-				}
-			}
-			resultsChan <- localResults
-		}(start, end)
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-
-	finalResults := make([]SimilarityResult, 0, 1000)
-	for chunk := range resultsChan {
-		finalResults = append(finalResults, chunk...)
-	}
-
-	sort.Slice(finalResults, func(i, j int) bool {
-		return finalResults[i].Score > finalResults[j].Score
-	})
-
-	topK := 50
-	if len(finalResults) < topK {
-		topK = len(finalResults)
-	}
-
-	return finalResults[:topK], numUsers, nil
-}
-
-func cosineSimilarity(ratingsA, ratingsB map[string]float64) float64 {
-
-	if len(ratingsA) > len(ratingsB) {
-		ratingsA, ratingsB = ratingsB, ratingsA
-	}
-
-	dotProduct := 0.0
-	normA_sq := 0.0
-
-	for movieID, scoreA := range ratingsA {
-		normA_sq += scoreA * scoreA
-		if scoreB, ok := ratingsB[movieID]; ok {
-			dotProduct += scoreA * scoreB
-		}
-	}
-
-	if dotProduct == 0 {
-		return 0.0
-	}
-
-	normB_sq := 0.0
-	for _, scoreB := range ratingsB {
-		normB_sq += scoreB * scoreB
-	}
-
-	if normA_sq == 0 || normB_sq == 0 {
-		return 0.0
-	}
-
-	return dotProduct / (math.Sqrt(normA_sq) * math.Sqrt(normB_sq))
-}
-
-//  CARGA DE DATOS (MongoDB -> RAM)
-
-func loadDataFromMongo() error {
-	log.Println("Conectando a MongoDB...")
-
-	// URI configurada para Docker
+func loadAndPreprocess() error {
+	log.Println("⏳ [FASE 1] Cargando datos de MongoDB...")
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
 		mongoURI = "mongodb://localhost:27017"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
-	if err != nil {
-		return err
-	}
+	ctx := context.TODO()
+	client, _ := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
 	defer client.Disconnect(ctx)
 
-	coll := client.Database("movielens").Collection("ratings")
+	db := client.Database("movielens")
 
-	log.Println("Descargando ratings a memoria...")
-
-	opts := options.Find().SetProjection(bson.D{
-		{Key: "user_id", Value: 1},
-		{Key: "movie_id", Value: 1},
-		{Key: "score", Value: 1},
-	})
-
-	cursor, err := coll.Find(ctx, bson.D{}, opts)
+	// [NUEVO] Cargar Géneros de Películas
+	log.Println("   -> Cargando catálogo de películas...")
+	cursorMov, err := db.Collection("movies").Find(ctx, bson.D{})
 	if err != nil {
 		return err
 	}
-	defer cursor.Close(ctx)
 
-	tempData := make(UserRatings)
-	tempIDs := make([]string, 0, 70000)
+	tempGenres := make(map[string]string)
+	for cursorMov.Next(ctx) {
+		var m MovieDoc
+		cursorMov.Decode(&m)
+		tempGenres[m.ID] = m.Genres
+	}
+	cursorMov.Close(ctx)
 
-	count := 0
-	for cursor.Next(ctx) {
-		var r RatingDoc
-		if err := cursor.Decode(&r); err != nil {
-			continue
-		}
-
-		if _, exists := tempData[r.UserID]; !exists {
-			tempData[r.UserID] = make(map[string]float64)
-			tempIDs = append(tempIDs, r.UserID)
-		}
-		tempData[r.UserID][r.MovieID] = r.Score
-		count++
-
-		if count%1000000 == 0 {
-			fmt.Printf("\r   -> %d ratings procesados...", count)
-		}
+	// Cargar Ratings (Igual que antes)
+	cursor, err := db.Collection("ratings").Find(ctx, bson.D{})
+	if err != nil {
+		return err
 	}
 
+	tempRatings := make(map[string]map[string]float64)
+	tempNorms := make(map[string]float64)
+	var tempIDs []string
+
+	for cursor.Next(ctx) {
+		var r RatingDoc
+		cursor.Decode(&r)
+		if _, ok := tempRatings[r.UserID]; !ok {
+			tempRatings[r.UserID] = make(map[string]float64)
+			tempIDs = append(tempIDs, r.UserID)
+		}
+		tempRatings[r.UserID][r.MovieID] = r.Score
+	}
+
+	// Cálculo de Normas (Igual que antes)
+	for uid, movies := range tempRatings {
+		sumSq := 0.0
+		for _, score := range movies {
+			sumSq += score * score
+		}
+		tempNorms[uid] = math.Sqrt(sumSq)
+	}
+
+	sort.Strings(tempIDs)
+
 	dataMutex.Lock()
-	globalData = tempData
+	userRatings = tempRatings
+	userNorms = tempNorms
+	movieGenres = tempGenres // [NUEVO] Guardar géneros
 	allUserIDs = tempIDs
 	dataMutex.Unlock()
 
-	log.Printf("\nCarga Completa: %d ratings de %d usuarios.", count, len(allUserIDs))
+	log.Printf("✅ Preprocesamiento finalizado: %d usuarios y %d películas.", len(tempIDs), len(tempGenres))
 	return nil
+}
+
+// --- CÁLCULO FINAL (Similitud + Filtro de Género) ---
+func calculateRange(targetID string, start, end int, genreFilter string) ([]MovieRecommendation, int) {
+	dataMutex.RLock()
+	defer dataMutex.RUnlock()
+
+	targetMovies, ok := userRatings[targetID]
+	if !ok {
+		return nil, 0
+	}
+	targetNorm := userNorms[targetID]
+
+	if start < 0 {
+		start = 0
+	}
+	if end > len(allUserIDs) {
+		end = len(allUserIDs)
+	}
+
+	// Mapa para acumular puntajes de películas candidatas
+	candidateMovies := make(map[string]float64)
+	processed := 0
+
+	// 1. Encontrar Vecinos (Collaborative Filtering)
+	for i := start; i < end; i++ {
+		otherID := allUserIDs[i]
+		if otherID == targetID {
+			continue
+		}
+
+		otherMovies := userRatings[otherID]
+		otherNorm := userNorms[otherID]
+
+		dotProduct := 0.0
+		for mID, scoreA := range targetMovies {
+			if scoreB, ok := otherMovies[mID]; ok {
+				dotProduct += scoreA * scoreB
+			}
+		}
+
+		if dotProduct > 0 {
+			similarity := dotProduct / (targetNorm * otherNorm)
+
+			// Si es un vecino similar, agregamos sus películas a los candidatos
+			if similarity > 0.3 { // Umbral de similitud
+				for mID, rating := range otherMovies {
+					// Solo recomendar si el target NO la ha visto
+					if _, seen := targetMovies[mID]; !seen {
+						// [NUEVO] FILTRO DE GÉNERO
+						// Si hay filtro y la película no lo contiene, saltar.
+						if genreFilter != "" && !strings.Contains(movieGenres[mID], genreFilter) {
+							continue
+						}
+
+						// Score = Similitud del vecino * Rating que le dio
+						candidateMovies[mID] += similarity * rating
+					}
+				}
+			}
+		}
+		processed++
+	}
+
+	// 2. Convertir mapa a lista para ordenar
+	var results []MovieRecommendation
+	for mID, score := range candidateMovies {
+		results = append(results, MovieRecommendation{MovieID: mID, Score: score})
+	}
+
+	// 3. Ordenar Top Películas
+	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+	if len(results) > 50 {
+		results = results[:50]
+	}
+
+	return results, processed
 }
