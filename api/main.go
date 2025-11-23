@@ -33,8 +33,6 @@ var (
 	TOTAL_USERS = 70000
 )
 
-// --- ESTRUCTURAS ---
-
 type Movie struct {
 	ID     string `json:"id" bson:"_id"`
 	Title  string `json:"title" bson:"title"`
@@ -67,7 +65,7 @@ type APIResponse struct {
 	TotalProcessed  int                   `json:"total_processed_users,omitempty"`
 	FilterUsed      string                `json:"filter_used"`
 	UserName        string                `json:"user_name"`
-	NodesInvolved   []string              `json:"nodes_involved,omitempty"` // [IMPORTANTE] Para ver los nodos
+	NodesInvolved   []string              `json:"nodes_involved,omitempty"`
 	Recommendations []MovieRecommendation `json:"recommendations"`
 }
 
@@ -84,14 +82,14 @@ func main() {
 	var err error
 	mongoClient, err = mongo.Connect(ctx, options.Client().ApplyURI(MONGO_URI))
 	if err != nil {
-		log.Fatalf("❌ Error conectando a Mongo: %v", err)
+		log.Fatalf("Error conectando a Mongo: %v", err)
 	}
 
 	http.HandleFunc("/recommend", handleRecommend)
 	http.HandleFunc("/movies", handleGetMovies)
 
-	log.Printf("🌐 API Coordinador lista en %s", PORT)
-	log.Printf("🔗 Workers detectados: %v", WORKER_ADDRS)
+	log.Printf("API Coordinador lista en %s", PORT)
+	log.Printf("Workers detectados: %v", WORKER_ADDRS)
 	http.ListenAndServe(PORT, nil)
 }
 
@@ -120,29 +118,25 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	fakeName := generateFakeName(userID)
 	cacheKey := "rec:" + userID + ":" + genre
 
-	// 1. INTENTO DE CACHÉ (Optimizado)
 	val, err := redisClient.Get(ctx, cacheKey).Result()
 	if err == nil {
-		// ¡CACHE HIT!
-		// Deserializamos SOLO la lista de películas guardada
+
 		var cachedRecs []MovieRecommendation
 		json.Unmarshal([]byte(val), &cachedRecs)
 
-		// Construimos una respuesta FRESCA con el tiempo actual (super rápido)
 		respObj := APIResponse{
-			Source:          "Cache (Redis)",            // <--- AQUI SE VE EL CAMBIO
-			ProcessingTime:  time.Since(start).String(), // <--- TIEMPO REAL (Microsegundos)
+			Source:          "Cache (Redis)",
+			ProcessingTime:  time.Since(start).String(),
 			FilterUsed:      genre,
 			UserName:        fakeName,
 			Recommendations: cachedRecs,
 		}
-		log.Printf("✅ [CACHE HIT] Respuesta rápida para Usuario %s", userID)
+		log.Printf("[CACHE HIT] Respuesta rápida para Usuario %s", userID)
 		json.NewEncoder(w).Encode(respObj)
 		return
 	}
 
-	// 2. SI NO HAY CACHÉ -> CLUSTER DE WORKERS
-	log.Printf("⚠️ [CACHE MISS] Usuario %s. Iniciando Scatter-Gather a %d nodos...", userID, len(WORKER_ADDRS))
+	log.Printf("[CACHE MISS] Usuario %s. Iniciando Scatter-Gather a %d nodos...", userID, len(WORKER_ADDRS))
 
 	numWorkers := len(WORKER_ADDRS)
 	chunkSize := TOTAL_USERS / numWorkers
@@ -150,7 +144,6 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	var wg sync.WaitGroup
 	resultsChan := make(chan WorkerResponse, numWorkers)
 
-	// SCATTER (Distribuir)
 	for i, addr := range WORKER_ADDRS {
 		wg.Add(1)
 		rStart := i * chunkSize
@@ -161,14 +154,14 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 
 		go func(address string, start, end int) {
 			defer wg.Done()
-			log.Printf(" -> Enviando tarea a %s (Rango %d-%d)", address, start, end) // LOG PARA EVIDENCIA
+			log.Printf(" -> Enviando tarea a %s (Rango %d-%d)", address, start, end)
 
 			resp, err := callWorker(address, userID, start, end, genre)
 			if err == nil {
-				log.Printf(" <- Recibido de %s (NodoID: %s)", address, resp.NodeID) // LOG PARA EVIDENCIA
+				log.Printf(" <- Recibido de %s (NodoID: %s)", address, resp.NodeID)
 				resultsChan <- *resp
 			} else {
-				log.Printf("❌ Error en nodo %s: %v", address, err)
+				log.Printf("Error en nodo %s: %v", address, err)
 			}
 		}(addr, rStart, rEnd)
 	}
@@ -176,15 +169,14 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 	close(resultsChan)
 
-	// GATHER (Recolectar)
 	movieScores := make(map[string]float64)
 	movieTitles := make(map[string]string)
 	totalProc := 0
-	var nodesInvolved []string // Lista para guardar los IDs de los nodos
+	var nodesInvolved []string
 
 	for resp := range resultsChan {
 		totalProc += resp.ProcessedCount
-		nodesInvolved = append(nodesInvolved, resp.NodeID) // Guardamos quién respondió
+		nodesInvolved = append(nodesInvolved, resp.NodeID)
 
 		for _, rec := range resp.Recommendations {
 			movieScores[rec.MovieID] += rec.Score
@@ -194,7 +186,6 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Ordenar
 	var finalRecs []MovieRecommendation
 	for mID, score := range movieScores {
 		finalRecs = append(finalRecs, MovieRecommendation{
@@ -208,22 +199,20 @@ func handleRecommend(w http.ResponseWriter, r *http.Request) {
 		finalRecs = finalRecs[:10]
 	}
 
-	// Respuesta Final (Cluster)
 	respObj := APIResponse{
 		Source:          "Distributed Cluster (Scatter-Gather)",
 		ProcessingTime:  time.Since(start).String(),
 		TotalProcessed:  totalProc,
 		FilterUsed:      genre,
 		UserName:        fakeName,
-		NodesInvolved:   nodesInvolved, // <--- AQUI SE VEN LOS NODOS
+		NodesInvolved:   nodesInvolved,
 		Recommendations: finalRecs,
 	}
 
-	// GUARDAR EN CACHÉ (Solo la lista de películas, para ahorrar espacio y permitir metadata dinámica)
 	recsBytes, _ := json.Marshal(finalRecs)
 	redisClient.Set(ctx, cacheKey, recsBytes, 10*time.Minute)
 
-	log.Printf("🔄 [FIN] Procesado en %v. Nodos: %v", time.Since(start), nodesInvolved)
+	log.Printf("[FIN] Procesado en %v. Nodos: %v", time.Since(start), nodesInvolved)
 	json.NewEncoder(w).Encode(respObj)
 }
 

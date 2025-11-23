@@ -19,7 +19,6 @@ import (
 
 const PORT = ":8081"
 
-// --- ESTRUCTURAS ---
 type WorkerRequest struct {
 	TargetUserID string `json:"target_user_id"`
 	RangeStart   int    `json:"range_start"`
@@ -36,7 +35,7 @@ type WorkerResponse struct {
 
 type MovieRecommendation struct {
 	MovieID string  `json:"movie_id"`
-	Title   string  `json:"title"` // [NUEVO] Título de la película
+	Title   string  `json:"title"`
 	Score   float64 `json:"score"`
 }
 
@@ -48,17 +47,16 @@ type RatingDoc struct {
 
 type MovieDoc struct {
 	ID     string `bson:"_id"`
-	Title  string `bson:"title"` // [NUEVO] Leemos el título de Mongo
+	Title  string `bson:"title"`
 	Genres string `bson:"genres"`
 }
 
-// --- VARIABLES GLOBALES ---
 var (
 	dataMutex   sync.RWMutex
 	userRatings map[string]map[string]float64
 	userNorms   map[string]float64
 	movieGenres map[string]string
-	movieTitles map[string]string // [NUEVO] Mapa de Títulos
+	movieTitles map[string]string
 	allUserIDs  []string
 	nodeID      string
 )
@@ -68,19 +66,19 @@ func main() {
 	if nodeID == "" {
 		nodeID, _ = os.Hostname()
 	}
-	log.Printf("👷 Nodo ML #%s Iniciando...", nodeID)
+	log.Printf("Nodo ML #%s Iniciando...", nodeID)
 
 	if err := loadAndPreprocess(); err != nil {
-		log.Fatalf("❌ Error en preprocesamiento: %v", err)
+		log.Fatalf("Error en preprocesamiento: %v", err)
 	}
 
 	listener, err := net.Listen("tcp", PORT)
 	if err != nil {
-		log.Fatalf("❌ Error TCP: %v", err)
+		log.Fatalf("Error TCP: %v", err)
 	}
 	defer listener.Close()
 
-	log.Printf("🚀 Nodo #%s LISTO. Escuchando en %s", nodeID, PORT)
+	log.Printf("Nodo #%s LISTO. Escuchando en %s", nodeID, PORT)
 
 	for {
 		conn, err := listener.Accept()
@@ -214,7 +212,7 @@ func calculateRangeParallel(targetID string, start, end int, genreFilter string)
 
 	var results []MovieRecommendation
 	for mID, score := range finalCandidates {
-		// [NUEVO] Agregamos el título al resultado
+
 		title := movieTitles[mID]
 		results = append(results, MovieRecommendation{
 			MovieID: mID,
@@ -232,7 +230,7 @@ func calculateRangeParallel(targetID string, start, end int, genreFilter string)
 }
 
 func loadAndPreprocess() error {
-	log.Println("⏳ [FASE 1] Cargando datos de MongoDB...")
+	log.Println("[FASE 1] Cargando datos de MongoDB...")
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
 		mongoURI = "mongodb://localhost:27017"
@@ -251,13 +249,13 @@ func loadAndPreprocess() error {
 	}
 
 	tempGenres := make(map[string]string)
-	tempTitles := make(map[string]string) // [NUEVO]
+	tempTitles := make(map[string]string)
 
 	for cursorMov.Next(ctx) {
 		var m MovieDoc
 		cursorMov.Decode(&m)
 		tempGenres[m.ID] = m.Genres
-		tempTitles[m.ID] = m.Title // [NUEVO] Guardamos título
+		tempTitles[m.ID] = m.Title
 	}
 	cursorMov.Close(ctx)
 
@@ -281,7 +279,7 @@ func loadAndPreprocess() error {
 		tempRatings[r.UserID][r.MovieID] = r.Score
 	}
 
-	log.Printf("⏳ [FASE 2] Preprocesando Normas Vectoriales (Aprendizaje)...")
+	log.Printf("[FASE 2] Preprocesando Normas Vectoriales (Aprendizaje)...")
 	for uid, movies := range tempRatings {
 		sumSq := 0.0
 		for _, score := range movies {
@@ -296,10 +294,10 @@ func loadAndPreprocess() error {
 	userRatings = tempRatings
 	userNorms = tempNorms
 	movieGenres = tempGenres
-	movieTitles = tempTitles // [NUEVO]
+	movieTitles = tempTitles
 	allUserIDs = tempIDs
 	dataMutex.Unlock()
 
-	log.Printf("✅ Preprocesamiento finalizado: %d usuarios, %d peliculas.", len(tempIDs), len(tempGenres))
+	log.Printf("Preprocesamiento finalizado: %d usuarios, %d peliculas.", len(tempIDs), len(tempGenres))
 	return nil
 }

@@ -20,12 +20,20 @@ mongo_data/
 Estructura inicial de carpetas:
 
 CC65-TrabajoFinal/
+├── api/
+│   └── Dockerfile 
+│   └── main.go 
+├── worker/
+│   └── Dockerfile 
+│   └── main.go 
 ├── database/
-│   └── seeder.go       <-- (El código del sembrador que te di antes)
-├── docker-compose.yml  <-- (El archivo YAML para Mongo y Redis)
+│   └── seeder.go      
+├── ml-10M100K/ <- Dataset unzippeado 
+├── docker-compose.yml 
 ├── .gitignore
 ├── go.mod
 └── go.sum
+└── README.md
 
 Ejecuta:
 
