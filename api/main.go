@@ -9,12 +9,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -26,6 +28,7 @@ var (
 	WORKER_ADDRS = strings.Split(os.Getenv("WORKER_ADDRS"), ",")
 	REDIS_ADDR   = os.Getenv("REDIS_ADDR")
 	MONGO_URI    = os.Getenv("MONGO_URI")
+	JWT_SECRET   = []byte("dark_souls_3_peak")
 
 	ctx         = context.Background()
 	redisClient *redis.Client
@@ -33,10 +36,49 @@ var (
 	TOTAL_USERS = 70000
 )
 
+type RegisterRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type RateRequest struct {
+	UserID  string  `json:"user_id"`
+	MovieID string  `json:"movie_id"`
+	Score   float64 `json:"score"`
+}
+
+type LoginRequest struct {
+	UserID   string `json:"user_id"`
+	Password string `json:"password"`
+}
+
+type LoginResponse struct {
+	Token    string `json:"token"`
+	UserName string `json:"user_name"`
+}
+
+type UserClaims struct {
+	UserID string `json:"user_id"`
+	jwt.RegisteredClaims
+}
+
+type ClusterStats struct {
+	ActiveWorkers int    `json:"active_workers"`
+	CPUNum        int    `json:"cpu_cores_api"`
+	Goroutines    int    `json:"goroutines_api"`
+	MemoryUsage   uint64 `json:"memory_usage_mb"`
+}
+
 type Movie struct {
 	ID     string `json:"id" bson:"_id"`
 	Title  string `json:"title" bson:"title"`
 	Genres string `json:"genres" bson:"genres"`
+}
+
+type RatingHistory struct {
+	MovieID string  `json:"movie_id" bson:"movie_id"`
+	Title   string  `json:"title,omitempty"`
+	Score   float64 `json:"score" bson:"score"`
 }
 
 type WorkerRequest struct {
@@ -85,29 +127,242 @@ func main() {
 		log.Fatalf("Error conectando a Mongo: %v", err)
 	}
 
-	http.HandleFunc("/recommend", handleRecommend)
-	http.HandleFunc("/movies", handleGetMovies)
+	http.HandleFunc("/login", handleLogin)
+	http.HandleFunc("/recommend", corsMiddleware(handleRecommend))
+	http.HandleFunc("/movies", corsMiddleware(handleGetMovies))
+	http.HandleFunc("/history", corsMiddleware(handleGetHistory))
+	http.HandleFunc("/stats", corsMiddleware(handleStats))
+	http.HandleFunc("/register", corsMiddleware(handleRegister))
+	http.HandleFunc("/rate", corsMiddleware(handleAddRating))
 
 	log.Printf("API Coordinador lista en %s", PORT)
-	log.Printf("Workers detectados: %v", WORKER_ADDRS)
 	http.ListenAndServe(PORT, nil)
+}
+
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func handleRegister(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Cuerpo de solicitud inválido"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Username == "" || req.Password == "" || len(req.Password) < 3 {
+		http.Error(w, `{"error": "Datos incompletos. Se requiere username y password (min 3 chars)"}`, http.StatusBadRequest)
+		return
+	}
+
+	collUsers := mongoClient.Database("movielens").Collection("users")
+
+	var existingUser bson.M
+	err := collUsers.FindOne(ctx, bson.D{{Key: "username", Value: req.Username}}).Decode(&existingUser)
+	if err == nil {
+		http.Error(w, `{"error": "El nombre de usuario ya está en uso"}`, http.StatusConflict)
+		return
+	}
+
+	newUserID := strconv.FormatInt(time.Now().UnixNano()/1000000, 10)
+
+	if len(newUserID) > 10 {
+		newUserID = newUserID[len(newUserID)-10:]
+	}
+
+	newUserDoc := bson.D{
+		{Key: "user_id", Value: newUserID},
+		{Key: "username", Value: req.Username},
+		{Key: "password", Value: req.Password},
+		{Key: "created_at", Value: time.Now()},
+	}
+	_, err = collUsers.InsertOne(ctx, newUserDoc)
+	if err != nil {
+		log.Printf("Error insertando nuevo usuario: %v", err)
+		http.Error(w, `{"error": "Error interno al crear usuario"}`, http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message":  "Registro exitoso",
+		"user_id":  newUserID,
+		"username": req.Username,
+	})
+}
+
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	var req LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	if _, err := strconv.Atoi(req.UserID); err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "El Usuario debe ser un ID numérico"})
+		return
+	}
+
+	if req.Password != req.UserID {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Contraseña incorrecta (Tip: La contraseña es igual al ID)"})
+		return
+	}
+
+	claims := UserClaims{
+		UserID: req.UserID,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+			Issuer:    "movielens-api",
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, _ := token.SignedString(JWT_SECRET)
+
+	json.NewEncoder(w).Encode(LoginResponse{
+		Token:    tokenString,
+		UserName: generateFakeName(req.UserID),
+	})
+}
+
+func handleAddRating(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	var req RateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Cuerpo de solicitud inválido"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.UserID == "" || req.MovieID == "" || req.Score < 0.5 || req.Score > 5.0 {
+		http.Error(w, `{"error": "Datos incompletos o calificación fuera de rango (0.5 a 5.0)"}`, http.StatusBadRequest)
+		return
+	}
+
+	collRatings := mongoClient.Database("movielens").Collection("ratings")
+
+	filter := bson.D{{Key: "user_id", Value: req.UserID}, {Key: "movie_id", Value: req.MovieID}}
+	update := bson.D{{Key: "$set", Value: bson.D{{Key: "score", Value: req.Score}}}}
+	opts := options.Update().SetUpsert(true)
+
+	result, err := collRatings.UpdateOne(ctx, filter, update, opts)
+	if err != nil {
+		log.Printf("Error Upsert en ratings: %v", err)
+		http.Error(w, `{"error": "Error interno al guardar la calificación"}`, http.StatusInternalServerError)
+		return
+	}
+
+	cacheKeyPrefix := "rec:" + req.UserID + ":"
+	keys, err := redisClient.Keys(ctx, cacheKeyPrefix+"*").Result()
+	if err == nil && len(keys) > 0 {
+		redisClient.Del(ctx, keys...)
+		log.Printf("Cache limpia para Usuario %s (%d claves borradas)", req.UserID, len(keys))
+	}
+
+	w.WriteHeader(http.StatusOK)
+	message := "Calificación guardada exitosamente."
+	if result.UpsertedID != nil {
+		message = "Nueva calificación insertada exitosamente."
+	} else if result.ModifiedCount > 0 {
+		message = "Calificación existente actualizada exitosamente."
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": message,
+	})
+}
+
+func handleGetHistory(w http.ResponseWriter, r *http.Request) {
+	userID := r.URL.Query().Get("user_id")
+
+	collRatings := mongoClient.Database("movielens").Collection("ratings")
+	filter := bson.D{{Key: "user_id", Value: userID}}
+
+	opts := options.Find().SetLimit(20).SetSort(bson.D{{Key: "score", Value: -1}})
+
+	cursor, _ := collRatings.Find(ctx, filter, opts)
+	var history []RatingHistory
+	cursor.All(ctx, &history)
+
+	collMovies := mongoClient.Database("movielens").Collection("movies")
+	for i, item := range history {
+		var movie Movie
+		collMovies.FindOne(ctx, bson.D{{Key: "_id", Value: item.MovieID}}).Decode(&movie)
+		history[i].Title = movie.Title
+	}
+
+	json.NewEncoder(w).Encode(history)
+}
+
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	stats := ClusterStats{
+		ActiveWorkers: len(WORKER_ADDRS),
+		CPUNum:        runtime.NumCPU(),
+		Goroutines:    runtime.NumGoroutine(),
+		MemoryUsage:   m.Alloc / 1024 / 1024,
+	}
+	json.NewEncoder(w).Encode(stats)
 }
 
 func handleGetMovies(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
+	query := r.URL.Query().Get("q")
 	limit, _ := strconv.ParseInt(r.URL.Query().Get("limit"), 10, 64)
 	skip, _ := strconv.ParseInt(r.URL.Query().Get("skip"), 10, 64)
 	if limit == 0 {
 		limit = 20
 	}
 
+	filter := bson.D{}
+	if query != "" {
+
+		filter = bson.D{{Key: "title", Value: bson.D{{Key: "$regex", Value: query}, {Key: "$options", Value: "i"}}}}
+	}
+
 	coll := mongoClient.Database("movielens").Collection("movies")
+	count, _ := coll.CountDocuments(ctx, filter)
+
 	opts := options.Find().SetLimit(limit).SetSkip(skip)
-	cursor, _ := coll.Find(ctx, bson.D{}, opts)
+	cursor, _ := coll.Find(ctx, filter, opts)
+
 	var movies []Movie
 	cursor.All(ctx, &movies)
-	json.NewEncoder(w).Encode(map[string]interface{}{"count": len(movies), "movies": movies})
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"total":  count,
+		"page":   skip/limit + 1,
+		"movies": movies,
+	})
 }
 
 func handleRecommend(w http.ResponseWriter, r *http.Request) {
