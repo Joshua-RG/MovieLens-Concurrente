@@ -21,6 +21,19 @@ services:
     networks:
       - movielens-net
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: movielens_frontend
+    restart: always
+    ports:
+      - "80:80"  
+    depends_on:
+      - api     
+    networks:
+      - movielens-net
+
   api:
     container_name: movielens_api
     build:
