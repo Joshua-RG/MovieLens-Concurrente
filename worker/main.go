@@ -20,10 +20,14 @@ import (
 const PORT = ":8081"
 
 type WorkerRequest struct {
-	TargetUserID string `json:"target_user_id"`
-	RangeStart   int    `json:"range_start"`
-	RangeEnd     int    `json:"range_end"`
-	GenreFilter  string `json:"genre_filter"`
+	OpType string `json:"op_type"`
+
+	TargetUserID string  `json:"target_user_id"`
+	RangeStart   int     `json:"range_start"`
+	RangeEnd     int     `json:"range_end"`
+	GenreFilter  string  `json:"genre_filter"`
+	MovieID      string  `json:"movie_id"`
+	Score        float64 `json:"score"`
 }
 
 type WorkerResponse struct {
@@ -31,6 +35,7 @@ type WorkerResponse struct {
 	ProcessedCount  int                   `json:"processed_count"`
 	Recommendations []MovieRecommendation `json:"recommendations"`
 	Error           string                `json:"error,omitempty"`
+	Message         string                `json:"message,omitempty"`
 }
 
 type MovieRecommendation struct {
@@ -97,14 +102,47 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	results, count := calculateRangeParallel(req.TargetUserID, req.RangeStart, req.RangeEnd, req.GenreFilter)
+	if req.OpType == "UPDATE" {
+		handleUpdate(conn, req)
+	} else {
+		handleRecommendRequest(conn, req)
+	}
+}
 
+func handleUpdate(conn net.Conn, req WorkerRequest) {
+
+	dataMutex.Lock()
+	defer dataMutex.Unlock()
+
+	if _, exists := userRatings[req.TargetUserID]; !exists {
+		userRatings[req.TargetUserID] = make(map[string]float64)
+
+	}
+
+	userRatings[req.TargetUserID][req.MovieID] = req.Score
+
+	sumSq := 0.0
+	for _, score := range userRatings[req.TargetUserID] {
+		sumSq += score * score
+	}
+	userNorms[req.TargetUserID] = math.Sqrt(sumSq)
+
+	resp := WorkerResponse{
+		NodeID:  nodeID,
+		Message: "Update in-memory successful",
+	}
+	json.NewEncoder(conn).Encode(resp)
+
+	log.Printf("[HOT UPDATE] Usuario %s actualizó película %s. Norma recalculada.", req.TargetUserID, req.MovieID)
+}
+
+func handleRecommendRequest(conn net.Conn, req WorkerRequest) {
+	results, count := calculateRangeParallel(req.TargetUserID, req.RangeStart, req.RangeEnd, req.GenreFilter)
 	resp := WorkerResponse{
 		NodeID:          nodeID,
 		ProcessedCount:  count,
 		Recommendations: results,
 	}
-
 	json.NewEncoder(conn).Encode(resp)
 }
 

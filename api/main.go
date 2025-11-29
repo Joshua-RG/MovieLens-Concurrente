@@ -82,10 +82,13 @@ type RatingHistory struct {
 }
 
 type WorkerRequest struct {
-	TargetUserID string `json:"target_user_id"`
-	RangeStart   int    `json:"range_start"`
-	RangeEnd     int    `json:"range_end"`
-	GenreFilter  string `json:"genre_filter"`
+	OpType       string  `json:"op_type"`
+	TargetUserID string  `json:"target_user_id"`
+	RangeStart   int     `json:"range_start"`
+	RangeEnd     int     `json:"range_end"`
+	GenreFilter  string  `json:"genre_filter"`
+	MovieID      string  `json:"movie_id,omitempty"`
+	Score        float64 `json:"score,omitempty"`
 }
 
 type WorkerResponse struct {
@@ -185,7 +188,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		log.Printf("🔑 Acceso autorizado para usuario: %s", claims.UserID)
+		log.Printf("Acceso autorizado para usuario: %s", claims.UserID)
 		next(w, r)
 	}
 }
@@ -320,42 +323,74 @@ func handleAddRating(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. Validación básica
 	if req.UserID == "" || req.MovieID == "" || req.Score < 0.5 || req.Score > 5.0 {
 		http.Error(w, `{"error": "Datos incompletos o calificación fuera de rango (0.5 a 5.0)"}`, http.StatusBadRequest)
 		return
 	}
 
+	// 2. Guardar/Actualizar en MongoDB (Persistencia)
 	collRatings := mongoClient.Database("movielens").Collection("ratings")
 
+	// Upsert: Si existe actualiza, si no crea
 	filter := bson.D{{Key: "user_id", Value: req.UserID}, {Key: "movie_id", Value: req.MovieID}}
 	update := bson.D{{Key: "$set", Value: bson.D{{Key: "score", Value: req.Score}}}}
 	opts := options.Update().SetUpsert(true)
 
 	result, err := collRatings.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
-		log.Printf("Error Upsert en ratings: %v", err)
+		log.Printf("Error Upsert en Mongo: %v", err)
 		http.Error(w, `{"error": "Error interno al guardar la calificación"}`, http.StatusInternalServerError)
 		return
 	}
+	go broadcastUpdateToCluster(req.UserID, req.MovieID, req.Score)
 
 	cacheKeyPrefix := "rec:" + req.UserID + ":"
 	keys, err := redisClient.Keys(ctx, cacheKeyPrefix+"*").Result()
 	if err == nil && len(keys) > 0 {
 		redisClient.Del(ctx, keys...)
-		log.Printf("Cache limpia para Usuario %s (%d claves borradas)", req.UserID, len(keys))
+		log.Printf("🗑️ Cache limpia para Usuario %s (%d claves)", req.UserID, len(keys))
+	}
+
+	message := "Calificación guardada exitosamente."
+	if result.UpsertedID != nil {
+		message = "Nueva calificación insertada."
+	} else if result.ModifiedCount > 0 {
+		message = "Calificación actualizada."
 	}
 
 	w.WriteHeader(http.StatusOK)
-	message := "Calificación guardada exitosamente."
-	if result.UpsertedID != nil {
-		message = "Nueva calificación insertada exitosamente."
-	} else if result.ModifiedCount > 0 {
-		message = "Calificación existente actualizada exitosamente."
-	}
-
 	json.NewEncoder(w).Encode(map[string]string{
 		"message": message,
 	})
+}
+
+func broadcastUpdateToCluster(userID, movieID string, score float64) {
+	log.Printf("Broadcasting update para User %s a %d nodos...", userID, len(WORKER_ADDRS))
+
+	for _, addr := range WORKER_ADDRS {
+
+		go func(address string) {
+			conn, err := net.DialTimeout("tcp", address, 2*time.Second)
+			if err != nil {
+				log.Printf("Error update nodo %s: %v", address, err)
+				return
+			}
+			defer conn.Close()
+
+			req := WorkerRequest{
+				OpType:       "UPDATE",
+				TargetUserID: userID,
+				MovieID:      movieID,
+				Score:        score,
+			}
+			if err := json.NewEncoder(conn).Encode(req); err != nil {
+				log.Printf("Error enviando JSON a %s: %v", address, err)
+				return
+			}
+
+		}(addr)
+	}
 }
 
 func handleGetHistory(w http.ResponseWriter, r *http.Request) {
@@ -539,7 +574,11 @@ func callWorker(addr, userID string, start, end int, genre string) (*WorkerRespo
 	defer conn.Close()
 
 	req := WorkerRequest{
-		TargetUserID: userID, RangeStart: start, RangeEnd: end, GenreFilter: genre,
+		OpType:       "RECOMMEND",
+		TargetUserID: userID,
+		RangeStart:   start,
+		RangeEnd:     end,
+		GenreFilter:  genre,
 	}
 	json.NewEncoder(conn).Encode(req)
 
