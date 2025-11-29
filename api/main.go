@@ -128,12 +128,13 @@ func main() {
 	}
 
 	http.HandleFunc("/login", handleLogin)
-	http.HandleFunc("/recommend", corsMiddleware(handleRecommend))
-	http.HandleFunc("/movies", corsMiddleware(handleGetMovies))
-	http.HandleFunc("/history", corsMiddleware(handleGetHistory))
-	http.HandleFunc("/stats", corsMiddleware(handleStats))
 	http.HandleFunc("/register", corsMiddleware(handleRegister))
-	http.HandleFunc("/rate", corsMiddleware(handleAddRating))
+
+	http.HandleFunc("/recommend", corsMiddleware(authMiddleware(handleRecommend)))
+	http.HandleFunc("/movies", corsMiddleware(authMiddleware(handleGetMovies)))
+	http.HandleFunc("/history", corsMiddleware(authMiddleware(handleGetHistory)))
+	http.HandleFunc("/rate", corsMiddleware(authMiddleware(handleAddRating)))
+	http.HandleFunc("/stats", corsMiddleware(authMiddleware(handleStats)))
 
 	log.Printf("API Coordinador lista en %s", PORT)
 	http.ListenAndServe(PORT, nil)
@@ -149,6 +150,42 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		next(w, r)
+	}
+}
+
+func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		if r.Method == "OPTIONS" {
+			next(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			http.Error(w, `{"error": "Se requiere autenticación (Header Authorization faltante)"}`, http.StatusUnauthorized)
+			return
+		}
+
+		parts := strings.Split(authHeader, " ")
+		if len(parts) != 2 || parts[0] != "Bearer" {
+			http.Error(w, `{"error": "Formato de token inválido. Use 'Bearer <token>'"}`, http.StatusUnauthorized)
+			return
+		}
+		tokenString := parts[1]
+
+		claims := &UserClaims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return JWT_SECRET, nil
+		})
+
+		if err != nil || !token.Valid {
+			http.Error(w, `{"error": "Token inválido o expirado"}`, http.StatusUnauthorized)
+			return
+		}
+
+		log.Printf("🔑 Acceso autorizado para usuario: %s", claims.UserID)
 		next(w, r)
 	}
 }
@@ -209,7 +246,6 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 func handleLogin(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
-
 	if r.Method == "OPTIONS" {
 		return
 	}
@@ -220,20 +256,44 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := strconv.Atoi(req.UserID); err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "El Usuario debe ser un ID numérico"})
-		return
-	}
+	userIDFound := ""
+	userNameFound := ""
 
-	if req.Password != req.UserID {
-		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Contraseña incorrecta (Tip: La contraseña es igual al ID)"})
-		return
+	collUsers := mongoClient.Database("movielens").Collection("users")
+	var dbUser bson.M
+
+	err := collUsers.FindOne(ctx, bson.D{{Key: "username", Value: req.UserID}}).Decode(&dbUser)
+
+	if err == nil {
+
+		dbPass, _ := dbUser["password"].(string)
+		if dbPass != req.Password {
+			http.Error(w, `{"error": "Contraseña incorrecta"}`, http.StatusUnauthorized)
+			return
+		}
+
+		userIDFound = dbUser["user_id"].(string)
+		userNameFound = req.UserID
+	} else {
+
+		if _, err := strconv.Atoi(req.UserID); err == nil {
+			if req.Password == req.UserID {
+
+				userIDFound = req.UserID
+				userNameFound = generateFakeName(req.UserID)
+			} else {
+				http.Error(w, `{"error": "Contraseña incorrecta (Para dataset: Pass=ID)"}`, http.StatusUnauthorized)
+				return
+			}
+		} else {
+
+			http.Error(w, `{"error": "Usuario no registrado"}`, http.StatusUnauthorized)
+			return
+		}
 	}
 
 	claims := UserClaims{
-		UserID: req.UserID,
+		UserID: userIDFound,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
 			Issuer:    "movielens-api",
@@ -244,7 +304,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(LoginResponse{
 		Token:    tokenString,
-		UserName: generateFakeName(req.UserID),
+		UserName: userNameFound,
 	})
 }
 
