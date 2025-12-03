@@ -33,7 +33,7 @@ var (
 	ctx         = context.Background()
 	redisClient *redis.Client
 	mongoClient *mongo.Client
-	TOTAL_USERS = 70000
+	TOTAL_USERS = 163000
 )
 
 type RegisterRequest struct {

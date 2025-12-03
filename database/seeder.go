@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"encoding/csv"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -28,72 +28,68 @@ type Rating struct {
 }
 
 func main() {
-	fmt.Println("🌱 Iniciando el Seeder...")
+	fmt.Println("Iniciando Seeder para MovieLens 25M (CSV)...")
 	start := time.Now()
 
 	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
 	client, err := mongo.Connect(context.TODO(), clientOptions)
 	if err != nil {
-		log.Fatal("Error conectando al cliente Mongo:", err)
+		log.Fatal(err)
 	}
 	defer client.Disconnect(context.TODO())
-
-	err = client.Ping(context.TODO(), nil)
-	if err != nil {
-		log.Fatal("No se pudo hacer ping a MongoDB. ¿Está corriendo el contenedor?:", err)
-	}
-	fmt.Println("Conectado exitosamente a MongoDB!")
 
 	db := client.Database("movielens")
 
 	db.Collection("movies").Drop(context.TODO())
 	db.Collection("ratings").Drop(context.TODO())
-	fmt.Println("Base de datos limpia.")
 
-	loadMoviesToMongo("../ml-10M100K/movies.dat", db.Collection("movies"))
+	loadMoviesToMongo("../ml-25m/movies.csv", db.Collection("movies"))
 
-	// 3. Cargar Ratings
-	loadRatingsToMongo("../ml-10M100K/ratings.dat", db.Collection("ratings"))
+	loadRatingsToMongo("../ml-25m/ratings.csv", db.Collection("ratings"))
 
 	fmt.Printf("\n¡Proceso terminado en %v!\n", time.Since(start))
 }
 
 func loadMoviesToMongo(filePath string, collection *mongo.Collection) {
-	fmt.Println("--- Cargando Películas ---")
+	fmt.Println("--- Cargando Películas (movies.csv) ---")
 	file, err := os.Open(filePath)
 	if err != nil {
-		log.Fatalf("No se encontró el archivo %s: %v", filePath, err)
+		log.Fatalf("Error abriendo archivo: %v", err)
 	}
 	defer file.Close()
 
+	reader := csv.NewReader(file)
+
+	if _, err := reader.Read(); err != nil {
+		log.Fatal(err)
+	}
+
 	var batch []interface{}
-	scanner := bufio.NewScanner(file)
 	count := 0
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Split(line, "::")
-		if len(parts) < 3 {
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("Error leyendo línea: %v", err)
 			continue
 		}
 
 		movie := Movie{
-			ID:     parts[0],
-			Title:  parts[1],
-			Genres: parts[2],
+			ID:     record[0],
+			Title:  record[1],
+			Genres: record[2],
 		}
 		batch = append(batch, movie)
 		count++
 
 		if len(batch) >= 2000 {
-			_, err := collection.InsertMany(context.TODO(), batch)
-			if err != nil {
-				log.Printf("Error insertando lote de películas: %v", err)
-			}
+			collection.InsertMany(context.TODO(), batch)
 			batch = nil
 		}
 	}
-
 	if len(batch) > 0 {
 		collection.InsertMany(context.TODO(), batch)
 	}
@@ -101,56 +97,52 @@ func loadMoviesToMongo(filePath string, collection *mongo.Collection) {
 }
 
 func loadRatingsToMongo(filePath string, collection *mongo.Collection) {
-	fmt.Println("--- Cargando Ratings ---")
+	fmt.Println("--- Cargando Ratings (ratings.csv) ---")
 	file, err := os.Open(filePath)
 	if err != nil {
-		log.Fatalf("No se encontró el archivo %s: %v", filePath, err)
+		log.Fatalf("Error abriendo archivo: %v", err)
 	}
 	defer file.Close()
 
-	fmt.Println("Creating index on user_id...")
-	indexModel := mongo.IndexModel{
-		Keys: bson.D{{Key: "user_id", Value: 1}},
-	}
-	_, err = collection.Indexes().CreateOne(context.TODO(), indexModel)
-	if err != nil {
-		log.Printf("Advertencia creando índice: %v", err)
+	indexModel := mongo.IndexModel{Keys: bson.D{{Key: "user_id", Value: 1}}}
+	collection.Indexes().CreateOne(context.TODO(), indexModel)
+
+	reader := csv.NewReader(file)
+
+	if _, err := reader.Read(); err != nil {
+		log.Fatal(err)
 	}
 
 	var batch []interface{}
-	scanner := bufio.NewScanner(file)
 	count := 0
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Split(line, "::")
-		if len(parts) < 3 {
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
 			continue
 		}
 
-		score, _ := strconv.ParseFloat(parts[2], 64)
+		score, _ := strconv.ParseFloat(record[2], 64)
 
 		rating := Rating{
-			UserID:  parts[0],
-			MovieID: parts[1],
+			UserID:  record[0],
+			MovieID: record[1],
 			Score:   score,
 		}
 		batch = append(batch, rating)
 		count++
 
 		if len(batch) >= 10000 {
-			_, err := collection.InsertMany(context.TODO(), batch)
-			if err != nil {
-				log.Printf("Error insertando lote de ratings: %v", err)
-			}
+			collection.InsertMany(context.TODO(), batch)
 			batch = nil
-
-			if count%100000 == 0 {
+			if count%500000 == 0 {
 				fmt.Printf("\rInsertados: %d ratings...", count)
 			}
 		}
 	}
-
 	if len(batch) > 0 {
 		collection.InsertMany(context.TODO(), batch)
 	}
