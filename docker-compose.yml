@@ -45,6 +45,7 @@ services:
       - REDIS_ADDR=redis:6379
       - MONGO_URI=mongodb://mongodb:27017
       - WORKER_ADDRS=worker-1:8081,worker-2:8081,worker-3:8081
+      ## WORKER_ADDRS=worker-1:8081,worker-2:8081,worker-3:8081,worker-4:8081,worker-5:8081
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -53,6 +54,8 @@ services:
       - worker-1
       - worker-2
       - worker-3
+      #- worker-4
+      #- worker-5
     networks:
       - movielens-net
 
@@ -94,6 +97,32 @@ services:
       - mongodb
     networks:
       - movielens-net
+# 
+  # worker-4:
+  #   build:
+  #     context: .
+  #     dockerfile: worker/Dockerfile
+  #   container_name: worker-4
+  #   environment:
+  #     - MONGO_URI=mongodb://mongodb:27017
+  #     - NODE_ID=4
+  #   depends_on:
+  #     - mongodb
+  #   networks:
+  #     - movielens-net
+# 
+  # worker-5:
+  #   build:
+  #     context: .
+  #     dockerfile: worker/Dockerfile
+  #   container_name: worker-5
+  #   environment:
+  #     - MONGO_URI=mongodb://mongodb:27017
+  #     - NODE_ID=5
+  #   depends_on:
+  #     - mongodb
+  #   networks:
+  #     - movielens-net
 
 volumes:
   mongo_data:
