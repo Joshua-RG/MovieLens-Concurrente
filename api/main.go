@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
 	"go.mongodb.org/mongo-driver/bson"
@@ -114,6 +117,38 @@ type APIResponse struct {
 	Recommendations []MovieRecommendation `json:"recommendations"`
 }
 
+type ContainerInfo struct {
+	ID         string `json:"id"`
+	Names      string `json:"name"`
+	State      string `json:"state"`
+	Status     string `json:"status"`
+	CPUUsage   string `json:"cpu_usage"`
+	MemUsage   string `json:"mem_usage"`
+	MemLimit   string `json:"mem_limit"`
+	MemPercent string `json:"mem_percent"`
+}
+
+type DockerStats struct {
+	CPUStats    CPUStats    `json:"cpu_stats"`
+	PreCPUStats CPUStats    `json:"precpu_stats"`
+	MemoryStats MemoryStats `json:"memory_stats"`
+}
+
+type CPUStats struct {
+	CPUUsage       CPUUsage `json:"cpu_usage"`
+	SystemCPUUsage uint64   `json:"system_cpu_usage"`
+	OnlineCPUs     int      `json:"online_cpus"`
+}
+
+type CPUUsage struct {
+	TotalUsage uint64 `json:"total_usage"`
+}
+
+type MemoryStats struct {
+	Usage uint64 `json:"usage"`
+	Limit uint64 `json:"limit"`
+}
+
 func main() {
 	if len(WORKER_ADDRS) == 0 || WORKER_ADDRS[0] == "" {
 		WORKER_ADDRS = []string{"localhost:8081"}
@@ -138,6 +173,8 @@ func main() {
 	http.HandleFunc("/history", corsMiddleware(authMiddleware(handleGetHistory)))
 	http.HandleFunc("/rate", corsMiddleware(authMiddleware(handleAddRating)))
 	http.HandleFunc("/stats", corsMiddleware(authMiddleware(handleStats)))
+	http.HandleFunc("/admin/containers", corsMiddleware(authMiddleware(handleDockerContainers)))
+	http.HandleFunc("/admin/logs", corsMiddleware(authMiddleware(handleDockerLogs)))
 
 	log.Printf("API Coordinador lista en %s", PORT)
 	http.ListenAndServe(PORT, nil)
@@ -599,4 +636,103 @@ func generateFakeName(userID string) string {
 		return fmt.Sprintf("%s %s #%s", adjectives[adjIndex], animals[aniIndex], userID)
 	}
 	return fmt.Sprintf("%s %s", adjectives[adjIndex], animals[aniIndex])
+}
+
+func handleDockerContainers(w http.ResponseWriter, r *http.Request) {
+	// Conexión automática usando variables de entorno o socket por defecto
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		http.Error(w, "Error conectando a Docker: "+err.Error(), 500)
+		return
+	}
+	defer cli.Close()
+
+	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{})
+	if err != nil {
+		http.Error(w, "Error listando: "+err.Error(), 500)
+		return
+	}
+
+	var result []ContainerInfo
+
+	for _, c := range containers {
+		// Stats snapshot (stream=false)
+		statsBody, err := cli.ContainerStats(ctx, c.ID, false)
+
+		cpuPercent := 0.0
+		memUsage := 0.0
+		memLimit := 0.0
+		memPercent := 0.0
+
+		if err == nil {
+			var stats DockerStats
+			json.NewDecoder(statsBody.Body).Decode(&stats)
+			statsBody.Body.Close()
+
+			// Cálculo CPU
+			cpuDelta := float64(stats.CPUStats.CPUUsage.TotalUsage) - float64(stats.PreCPUStats.CPUUsage.TotalUsage)
+			systemDelta := float64(stats.CPUStats.SystemCPUUsage) - float64(stats.PreCPUStats.SystemCPUUsage)
+			numCPUs := float64(stats.CPUStats.OnlineCPUs)
+			if numCPUs == 0.0 {
+				numCPUs = float64(runtime.NumCPU())
+			}
+
+			if systemDelta > 0.0 && cpuDelta > 0.0 {
+				cpuPercent = (cpuDelta / systemDelta) * numCPUs * 100.0
+			}
+
+			// Cálculo RAM
+			memUsage = float64(stats.MemoryStats.Usage) / 1024 / 1024
+			memLimit = float64(stats.MemoryStats.Limit) / 1024 / 1024
+			if memLimit > 0 {
+				memPercent = (memUsage / memLimit) * 100.0
+			}
+		}
+
+		name := "unknown"
+		if len(c.Names) > 0 {
+			name = c.Names[0]
+		}
+
+		info := ContainerInfo{
+			ID:         c.ID[:10],
+			Names:      name,
+			State:      c.State,
+			Status:     c.Status,
+			CPUUsage:   fmt.Sprintf("%.2f%%", cpuPercent),
+			MemUsage:   fmt.Sprintf("%.0f MB", memUsage),
+			MemLimit:   fmt.Sprintf("%.0f MB", memLimit),
+			MemPercent: fmt.Sprintf("%.2f%%", memPercent),
+		}
+		result = append(result, info)
+	}
+
+	json.NewEncoder(w).Encode(result)
+}
+
+func handleDockerLogs(w http.ResponseWriter, r *http.Request) {
+	containerID := r.URL.Query().Get("id")
+	if containerID == "" {
+		http.Error(w, "Falta parámetro 'id'", 400)
+		return
+	}
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		http.Error(w, "Error Docker: "+err.Error(), 500)
+		return
+	}
+	defer cli.Close()
+
+	opts := types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Tail: "50"}
+	out, err := cli.ContainerLogs(ctx, containerID, opts)
+	if err != nil {
+		http.Error(w, "Error logs: "+err.Error(), 500)
+		return
+	}
+	defer out.Close()
+
+	logs, _ := io.ReadAll(out)
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write(logs)
 }
