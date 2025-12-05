@@ -1,0 +1,7 @@
+Escenario,Peticiones,Latencia_Fria_s,Procesamiento_Interno_s,Overhead_s,Latencia_Cache_s,CPU_Pico_%,RAM_Pico_MB,Tiempo_Carga
+1 Nodo,10,0.3089,0.3031,0.0058,0.0011,717.66,2897,N/A
+2 Nodo,10,0.1606,0.1571,0.0036,0.0005,322.37,5354,N/A
+3 Nodo,10,0.1233,0.1240,0.0000,0.0005,165.15,8182,N/A
+4 Nodo,10,0.0967,0.0944,0.0023,0.0005,161.22,10752,N/A
+5 Nodo,10,0.0886,0.0862,0.0025,0.0012,0.00,13174,N/A
+6 Nodo,10,0.0705,0.0680,0.0025,0.0005,0.00,15830,N/A

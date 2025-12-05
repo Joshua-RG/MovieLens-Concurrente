@@ -176,6 +176,11 @@ func main() {
 	http.HandleFunc("/admin/containers", corsMiddleware(authMiddleware(handleDockerContainers)))
 	http.HandleFunc("/admin/logs", corsMiddleware(authMiddleware(handleDockerLogs)))
 
+	// Ahora (Sin Auth):
+	// http.HandleFunc("/recommend", corsMiddleware(handleRecommend))
+	// http.HandleFunc("/admin/containers", corsMiddleware(handleDockerContainers))
+	// http.HandleFunc("/admin/logs", corsMiddleware(handleDockerLogs))
+
 	log.Printf("API Coordinador lista en %s", PORT)
 	http.ListenAndServe(PORT, nil)
 }

@@ -44,8 +44,9 @@ services:
     environment:
       - REDIS_ADDR=redis:6379
       - MONGO_URI=mongodb://mongodb:27017
-      - WORKER_ADDRS=worker-1:8081,worker-2:8081,worker-3:8081
-      ## WORKER_ADDRS=worker-1:8081,worker-2:8081,worker-3:8081,worker-4:8081,worker-5:8081
+      #- WORKER_ADDRS=worker-1:8081,worker-2:8081,worker-3:8081,worker-4:8081,worker-5:8081,worker-6:8081,worker-7:8081,worker-8:8081
+      - WORKER_ADDRS=worker-1:8081, worker-2:8081, worker-3:8081
+
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
@@ -54,8 +55,11 @@ services:
       - worker-1
       - worker-2
       - worker-3
-      #- worker-4
-      #- worker-5
+      # - worker-4
+      # - worker-5
+      # - worker-6
+      # - worker-7
+      # - worker-8
     networks:
       - movielens-net
 
@@ -84,7 +88,7 @@ services:
       - mongodb
     networks:
       - movielens-net
-
+ 
   worker-3:
     build:
       context: .
@@ -97,7 +101,7 @@ services:
       - mongodb
     networks:
       - movielens-net
-# 
+
   # worker-4:
   #   build:
   #     context: .
@@ -119,6 +123,45 @@ services:
   #   environment:
   #     - MONGO_URI=mongodb://mongodb:27017
   #     - NODE_ID=5
+  #   depends_on:
+  #     - mongodb
+  #   networks:
+  #     - movielens-net
+# 
+  # worker-6:
+  #   build:
+  #     context: .
+  #     dockerfile: worker/Dockerfile
+  #   container_name: worker-6
+  #   environment:
+  #     - MONGO_URI=mongodb://mongodb:27017
+  #     - NODE_ID=6
+  #   depends_on:
+  #     - mongodb
+  #   networks:
+  #     - movielens-net
+# 
+  # worker-7:
+  #   build:
+  #     context: .
+  #     dockerfile: worker/Dockerfile
+  #   container_name: worker-7
+  #   environment:
+  #     - MONGO_URI=mongodb://mongodb:27017
+  #     - NODE_ID=7
+  #   depends_on:
+  #     - mongodb
+  #   networks:
+  #     - movielens-net
+# 
+  # worker-8:
+  #   build:
+  #     context: .
+  #     dockerfile: worker/Dockerfile
+  #   container_name: worker-8
+  #   environment:
+  #     - MONGO_URI=mongodb://mongodb:27017
+  #     - NODE_ID=8
   #   depends_on:
   #     - mongodb
   #   networks:
